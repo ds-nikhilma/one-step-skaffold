@@ -1,4 +1,4 @@
-# mle-skaffold-e2e
+# one-step-skaffold
 
 One command to skaffold a lightning-core LRO, its worker and its smoketest under
 your alias, run the smoketest against your LRO, then tear it all down.
@@ -6,8 +6,8 @@ your alias, run the smoketest against your LRO, then tear it all down.
 ## Setup
 
 ```bash
-git clone https://github.com/ds-nikhilma/mle-skaffold-e2e.git ~/tools/mle-skaffold-e2e
-ln -s ~/tools/mle-skaffold-e2e/mle-skaffold-e2e.sh ~/.local/bin/   # or call it by full path
+git clone https://github.com/ds-nikhilma/one-step-skaffold.git ~/tools/one-step-skaffold
+ln -s ~/tools/one-step-skaffold/one-step-skaffold.sh ~/.local/bin/   # or call it by full path
 ```
 
 Before running:
@@ -21,10 +21,10 @@ Before running:
 Run from inside your lightning-core checkout:
 
 ```bash
-mle-skaffold-e2e.sh <service> -a <alias>
+one-step-skaffold.sh <service> -a <alias>
 
 # e.g.
-mle-skaffold-e2e.sh margin-line-detection -a nm
+one-step-skaffold.sh margin-line-detection -a nm
 ```
 
 | Flag | Default | |
@@ -41,10 +41,10 @@ If a service has several workers (e.g. `-v1.1.0` / `-v4.0.0`), the script lists
 them. Pick one with `-w`:
 
 ```bash
-mle-skaffold-e2e.sh tooth-recognition -a nm -w tooth-recognition-worker-v4.0
+one-step-skaffold.sh tooth-recognition -a nm -w tooth-recognition-worker-v4.0
 ```
 
-Exit code is `0` on pass. Logs are in `$TMPDIR/mle-skaffold-e2e/<alias>/`.
+Exit code is `0` on pass. Logs are in `$TMPDIR/one-step-skaffold/<alias>/`.
 
 ## Troubleshooting
 

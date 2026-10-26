@@ -12,7 +12,7 @@
 # The address edit in step 3 is applied automatically before the build and
 # reverted on exit, so the working tree is left untouched.
 #
-# Usage:  mle-skaffold-e2e.sh <lro-service> -a <alias> [options]
+# Usage:  one-step-skaffold.sh <lro-service> -a <alias> [options]
 #
 # Params:  <lro-service>   Name of the LRO service, e.g. cbct-panoramic-curve-proposal
 #          -a, --alias     Remotedev alias (required), e.g. nm
@@ -226,10 +226,10 @@ patch_address() {
   [[ "$hits" -eq 1 ]] \
     || die "expected exactly 1 'address =' const in ${API_FILE#"$REPO_ROOT/"}, found $hits — patch it by hand"
 
-  API_BACKUP="$(mktemp "${TMPDIR:-/tmp}/mle-skaffold-e2e-api.XXXXXX")"
+  API_BACKUP="$(mktemp "${TMPDIR:-/tmp}/one-step-skaffold-api.XXXXXX")"
   cp "$API_FILE" "$API_BACKUP"
 
-  tmp="$(mktemp "${TMPDIR:-/tmp}/mle-skaffold-e2e-sed.XXXXXX")"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/one-step-skaffold-sed.XXXXXX")"
   sed -E "s|^([[:space:]]*address[[:space:]]*=[[:space:]]*).*\$|\1\"${target}\"|" "$API_FILE" >"$tmp"
   # Write through rather than mv, so the file keeps its own mode and inode.
   cat "$tmp" >"$API_FILE"
@@ -427,7 +427,7 @@ main() {
   log "smoketest : ${LRO}-smoketest"
   log "target    : $NAMESPACE @ $KUBECONTEXT, alias '$ALIAS'"
 
-  LOG_DIR="${TMPDIR:-/tmp}/mle-skaffold-e2e/${ALIAS}"
+  LOG_DIR="${TMPDIR:-/tmp}/one-step-skaffold/${ALIAS}"
   mkdir -p "$LOG_DIR"
   log "logs      : $LOG_DIR"
 
