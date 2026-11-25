@@ -32,19 +32,28 @@ one-step-skaffold.sh margin-line-detection -a nm
 | `-a` | — | Your alias (required) |
 | `-n` | `core` | Namespace |
 | `-c` | `lightning-d2` | Kubecontext |
-| `-w` | auto | Worker deployment, if more than one matches |
+| `-w` | auto | Worker deployment, if more than one matches; repeat for several |
+| `--all-workers` | | Skaffold every worker deployment that matches |
 | `--no-worker` | | Skip the worker |
 | `--keep` | | Don't tear down afterwards |
 | `--timeout` | `1800` | Smoketest timeout (seconds) |
 
 If a service has several workers (e.g. `-v1.1.0` / `-v4.0.0`), the script lists
-them. Pick one with `-w`:
+them and stops. Pick one with `-w`, several by repeating `-w`, or all of them
+with `--all-workers`:
 
 ```bash
 one-step-skaffold.sh tooth-recognition -a nm -w tooth-recognition-worker-v4.0
+one-step-skaffold.sh di-segmentation-lro -a nm --all-workers
 ```
 
-Exit code is `0` on pass. Logs are in `$TMPDIR/one-step-skaffold/<alias>/`.
+The aliased LRO only sees workers deployed under the same alias. If the
+smoketest runs once per worker version (di-segmentation-lro does), deploy all
+of them, or the versions you left out fail with "no available worker version
+satisfies constraint".
+
+Exit code is `0` on pass. Logs are in `$TMPDIR/one-step-skaffold/<alias>/`
+(`worker.log` for one worker, `worker-<deployment>.log` each for several).
 
 ## Troubleshooting
 
