@@ -18,7 +18,9 @@
 #          -a, --alias     Remotedev alias (required), e.g. nm
 #          -n, --namespace Kubernetes namespace (default: core)
 #          -c, --context   Kubecontext (default: lightning-d2)
-#          -w, --worker    Worker name (default: auto-detected in the namespace)
+#          -w, --worker    Worker deployment (default: auto-detected in the namespace);
+#                          repeat to skaffold several, e.g. -w x-worker-v4.0 -w x-worker-v4.1
+#              --all-workers  Skaffold every worker deployment that matches the service
 #              --no-worker Skip the worker; only skaffold the LRO and smoketest
 #              --keep      Leave the skaffold sessions running after the smoketest
 #              --timeout   Seconds to wait for the smoketest job (default: 1800)
@@ -33,7 +35,7 @@ set -m
 
 # Line range of the Usage/Params block above, printed by usage().
 readonly USAGE_FIRST_LINE=15
-readonly USAGE_LAST_LINE=26
+readonly USAGE_LAST_LINE=28
 
 readonly DEFAULT_NAMESPACE="core"
 readonly DEFAULT_KUBECONTEXT="lightning-d2"
@@ -47,9 +49,15 @@ LRO=""
 ALIAS=""
 NAMESPACE="$DEFAULT_NAMESPACE"
 KUBECONTEXT="$DEFAULT_KUBECONTEXT"
-WORKER=""
-WORKER_SERVICE=""
-WORKER_DEPLOYMENT=""
+# Worker state is kept in parallel arrays, one entry per worker deployment.
+# macOS ships bash 3.2, where expanding an empty array trips `set -u`: guard
+# every "${ARR[@]}" with a ${#ARR[@]} check.
+REQUESTED_WORKERS=()     # from -w, in the order given
+WORKER_SERVICES=()       # dscore service (source directory) name
+WORKER_DEPLOYMENTS=()    # live deployment name dscore clones
+WORKER_LOGS=()
+WORKER_PIDS=()
+ALL_WORKERS=false
 RUN_WORKER=true
 KEEP=false
 SMOKETEST_TIMEOUT="$DEFAULT_SMOKETEST_TIMEOUT"
@@ -59,7 +67,6 @@ API_FILE=""
 API_BACKUP=""
 LOG_DIR=""
 LAST_PID=""
-WORKER_PID=""
 LRO_PID=""
 SMOKETEST_PID=""
 
@@ -78,8 +85,11 @@ parse_args() {
       -a|--alias)     ALIAS="${2:-}";            shift 2 ;;
       -n|--namespace) NAMESPACE="${2:-}";        shift 2 ;;
       -c|--context)   KUBECONTEXT="${2:-}";      shift 2 ;;
-      -w|--worker)    WORKER="${2:-}";           shift 2 ;;
+      -w|--worker)
+        [[ -n "${2:-}" ]] || die "-w needs a worker deployment name"
+        REQUESTED_WORKERS+=("$2");               shift 2 ;;
       --timeout)      SMOKETEST_TIMEOUT="${2:-}"; shift 2 ;;
+      --all-workers)  ALL_WORKERS=true;          shift ;;
       --no-worker)    RUN_WORKER=false;          shift ;;
       --keep)         KEEP=true;                 shift ;;
       -h|--help)      usage 0 ;;
@@ -95,6 +105,12 @@ parse_args() {
   [[ "$ALIAS" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
     || die "alias '$ALIAS' is not a valid DNS label; it becomes part of the k8s object name"
   [[ "$SMOKETEST_TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout must be a whole number of seconds"
+  if [[ "$ALL_WORKERS" == true && ${#REQUESTED_WORKERS[@]} -gt 0 ]]; then
+    die "--all-workers and -w are mutually exclusive"
+  fi
+  if [[ "$RUN_WORKER" != true ]] && [[ "$ALL_WORKERS" == true || ${#REQUESTED_WORKERS[@]} -gt 0 ]]; then
+    die "--no-worker cannot be combined with -w or --all-workers"
+  fi
 }
 
 kc() { kubectl --context "$KUBECONTEXT" -n "$NAMESPACE" "$@"; }
@@ -149,31 +165,28 @@ preflight() {
 #                cbct-segmentation-worker-t4, tooth-recognition-worker-v2.0).
 # So: try both stems, prefer an exact <stem> hit, otherwise prefix-match. When
 # more than one tagged worker matches we refuse to guess — silently picking a
-# side of a live version/accelerator split would test the wrong thing.
-#
-# For versioned workers (MLE-2461+), sets:
-#   WORKER_SERVICE    — the base service name for dscore skaffold (directory name)
-#   WORKER_DEPLOYMENT — the versioned deployment name for kubectl checks
-#   WORKER            — the name to display (same as WORKER_DEPLOYMENT)
+# side of a live version/accelerator split would test the wrong thing. The
+# caller then chooses with -w (repeatable) or takes them all with --all-workers.
+# Smoketests that exercise every deployed worker version need all of them: the
+# aliased LRO only sees workers deployed under the same alias.
 resolve_worker() {
   local prefixes=("${LRO}-worker") prefix name
   local -a matches=()
   [[ "${LRO%-lro}-worker" == "${LRO}-worker" ]] || prefixes+=("${LRO%-lro}-worker")
 
-  if [[ -n "$WORKER" ]]; then
-    kc get deployment "$WORKER" >/dev/null 2>&1 \
-      || die "no Deployment '$WORKER' in $NAMESPACE"
-    # User provided explicit worker name — detect if it's versioned
-    detect_worker_versioning "$WORKER"
+  if [[ ${#REQUESTED_WORKERS[@]} -gt 0 ]]; then
+    for name in "${REQUESTED_WORKERS[@]}"; do
+      kc get deployment "$name" >/dev/null 2>&1 \
+        || die "no Deployment '$name' in $NAMESPACE"
+      add_worker "$name"
+    done
     return 0
   fi
 
   # Try exact match first (unversioned deployment)
   for prefix in "${prefixes[@]}"; do
     if kc get deployment "$prefix" >/dev/null 2>&1; then
-      WORKER="$prefix"
-      WORKER_SERVICE="$prefix"
-      WORKER_DEPLOYMENT="$prefix"
+      add_worker "$prefix"
       return 0
     fi
   done
@@ -189,32 +202,35 @@ resolve_worker() {
   case "${#matches[@]}" in
     0) die "no worker Deployment for '$LRO' in $NAMESPACE (tried: ${prefixes[*]}) — pass -w <name> or --no-worker" ;;
     1)
-      WORKER="${matches[0]}"
-      detect_worker_versioning "$WORKER"
+      add_worker "${matches[0]}"
       ;;
     *)
-      # Multiple versioned workers found
-      die "several worker Deployments match '$LRO' in $NAMESPACE: ${matches[*]} — pick one with -w <name>"
+      if [[ "$ALL_WORKERS" == true ]]; then
+        for name in "${matches[@]}"; do add_worker "$name"; done
+      else
+        die "several worker Deployments match '$LRO' in $NAMESPACE: ${matches[*]} — pick with -w <name> (repeatable), or take them all with --all-workers"
+      fi
       ;;
   esac
 }
 
-# Detect if a worker deployment is versioned and set WORKER_SERVICE/WORKER_DEPLOYMENT accordingly.
-# Versioned deployments follow the pattern: <base-name>-v<major>.<minor>.<patch>
-detect_worker_versioning() {
-  local worker_name="$1"
-
-  # Check if the name ends with a version pattern like -v2.5.0 or -v2.4.0
-  if [[ "$worker_name" =~ ^(.+)-(v[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
-    # Versioned worker: margin-line-detection-worker-v2.5.0
-    WORKER_SERVICE="${BASH_REMATCH[1]}"    # margin-line-detection-worker
-    WORKER_DEPLOYMENT="$worker_name"        # margin-line-detection-worker-v2.5.0
-    log "detected versioned worker: service='$WORKER_SERVICE', deployment='$WORKER_DEPLOYMENT'"
-  else
-    # Unversioned worker or other suffix (t4, etc.)
-    WORKER_SERVICE="$worker_name"
-    WORKER_DEPLOYMENT="$worker_name"
+# Register one worker deployment. Versioned deployments follow the pattern
+# <base-name>-v<major>.<minor>[.<patch>]: dscore skaffolds the base service and
+# clones the versioned deployment via --deployment.
+add_worker() {
+  local deployment="$1" service="$1" i
+  if [[ ${#WORKER_DEPLOYMENTS[@]} -gt 0 ]]; then
+    for i in "${WORKER_DEPLOYMENTS[@]}"; do
+      [[ "$i" != "$deployment" ]] || die "worker '$deployment' given twice"
+    done
   fi
+
+  if [[ "$deployment" =~ ^(.+)-(v[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+    service="${BASH_REMATCH[1]}"
+    log "detected versioned worker: service='$service', deployment='$deployment'"
+  fi
+  WORKER_SERVICES+=("$service")
+  WORKER_DEPLOYMENTS+=("$deployment")
 }
 
 # Repoint the LRO client at the aliased pod. Rewrites the whole right-hand side
@@ -335,10 +351,13 @@ cleanup() {
 
   restore_address
   stop_session "$SMOKETEST_PID" "smoketest" || torn_down=false
+  local i
   if [[ "$KEEP" == true ]]; then
     local groups=""
     [[ -n "${LRO_PID:-}" ]] && groups+=" -$LRO_PID"
-    [[ -n "${WORKER_PID:-}" ]] && groups+=" -$WORKER_PID"
+    if [[ ${#WORKER_PIDS[@]} -gt 0 ]]; then
+      for i in "${WORKER_PIDS[@]}"; do groups+=" -$i"; done
+    fi
     if [[ -n "$groups" ]]; then
       warn "--keep set: leaving the LRO and worker sessions running."
       warn "stop them with: kill -INT --$groups"
@@ -346,7 +365,12 @@ cleanup() {
     fi
   else
     stop_session "$LRO_PID" "$LRO" || torn_down=false
-    stop_session "$WORKER_PID" "$WORKER" || torn_down=false
+    # WORKER_PIDS only holds sessions that were started; index it, not the deployments.
+    if [[ ${#WORKER_PIDS[@]} -gt 0 ]]; then
+      for i in "${!WORKER_PIDS[@]}"; do
+        stop_session "${WORKER_PIDS[$i]}" "${WORKER_DEPLOYMENTS[$i]}" || torn_down=false
+      done
+    fi
     report_residue
   fi
 
@@ -420,7 +444,7 @@ main() {
 
   log "service   : $LRO"
   if [[ "$RUN_WORKER" == true ]]; then
-    log "worker    : $WORKER"
+    log "worker    : ${WORKER_DEPLOYMENTS[*]}"
   else
     log "worker    : (skipped)"
   fi
@@ -436,20 +460,37 @@ main() {
   trap 'cleanup 143' TERM
   patch_address
 
-  if [[ "$RUN_WORKER" == true ]]; then
-    # For versioned workers, pass both service name and deployment name
-    if [[ "$WORKER_SERVICE" != "$WORKER_DEPLOYMENT" ]]; then
-      start_session "$WORKER_SERVICE" service "$LOG_DIR/worker.log" "$WORKER_DEPLOYMENT"
-      WORKER_PID="$LAST_PID"
-    else
-      start_session "$WORKER" service "$LOG_DIR/worker.log"
-      WORKER_PID="$LAST_PID"
-    fi
-  fi
+  # The LRO has its own Service, so it builds alongside the first worker.
   start_session "$LRO" service "$LOG_DIR/lro.log"; LRO_PID="$LAST_PID"
 
+  # Workers start one after another. Versioned deployments of one service share
+  # a single aliased Service (e.g. di-segmentation-worker-<alias>); two sessions
+  # applying it at once race to create it, the loser fails with AlreadyExists
+  # and its cleanup deletes the Service from under the winner. Once the first
+  # worker is ready the Service exists and later sessions merely update it.
+  local i
   if [[ "$RUN_WORKER" == true ]]; then
-    wait_for_deployment "$WORKER_DEPLOYMENT" "$WORKER_PID" "$LOG_DIR/worker.log"
+    for i in "${!WORKER_DEPLOYMENTS[@]}"; do
+      if (( i > 0 )); then
+        wait_for_deployment "${WORKER_DEPLOYMENTS[$((i - 1))]}" "${WORKER_PIDS[$((i - 1))]}" "${WORKER_LOGS[$((i - 1))]}"
+      fi
+      # One worker keeps the historical worker.log; several get one log each.
+      if [[ ${#WORKER_DEPLOYMENTS[@]} -eq 1 ]]; then
+        WORKER_LOGS+=("$LOG_DIR/worker.log")
+      else
+        WORKER_LOGS+=("$LOG_DIR/worker-${WORKER_DEPLOYMENTS[$i]}.log")
+      fi
+      # Versioned workers: skaffold the base service, clone the versioned deployment.
+      if [[ "${WORKER_SERVICES[$i]}" != "${WORKER_DEPLOYMENTS[$i]}" ]]; then
+        start_session "${WORKER_SERVICES[$i]}" service "${WORKER_LOGS[$i]}" "${WORKER_DEPLOYMENTS[$i]}"
+      else
+        start_session "${WORKER_DEPLOYMENTS[$i]}" service "${WORKER_LOGS[$i]}"
+      fi
+      WORKER_PIDS+=("$LAST_PID")
+    done
+    # Only the last worker has not been waited for yet.
+    i=$(( ${#WORKER_PIDS[@]} - 1 ))
+    wait_for_deployment "${WORKER_DEPLOYMENTS[$i]}" "${WORKER_PIDS[$i]}" "${WORKER_LOGS[$i]}"
   fi
   wait_for_deployment "$LRO" "$LRO_PID" "$LOG_DIR/lro.log"
 
